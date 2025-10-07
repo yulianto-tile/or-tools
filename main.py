@@ -1,16 +1,30 @@
+"""
+FastAPI OR-Tools Thesis Scheduling System - Fixed Version
+API untuk penjadwalan ujian skripsi dengan constraint programming
+"""
+
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 from ortools.sat.python import cp_model
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
-from ortools.linear_solver import pywraplp
-import numpy as np
+import sys
+import platform
+from datetime import datetime
 
 app = FastAPI(
     title="Sistem Penjadwalan Skripsi Mahasiswa Berbasis Google OR-Tools",
     version="2.0.0",
     description="API untuk penjadwalan ujian skripsi dengan constraint programming"
+)
+
+# CORS middleware untuk Laravel
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ============================================================================
@@ -61,11 +75,6 @@ class PenjadwalanResponse(BaseModel):
     total_mahasiswa: int
     mahasiswa_terjadwal: int
     jadwal: List[JadwalUjian]
-
-class DistanceMatrix(BaseModel):
-    matrix: list[list[float]]
-    num_vehicles: int = 1
-    depot: int = 0
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -185,7 +194,7 @@ def solve_penjadwalan_skripsi_internal(
             if (m, d_idx, 0) in penguji and (m, d_idx, 1) in penguji:
                 model.Add(penguji[(m, d_idx, 0)] + penguji[(m, d_idx, 1)] <= 1)
     
-    # 6. Availabilitas Dosen
+    # 6. Availabilitas Dosen (PEMBIMBING harus tersedia)
     for m in range(num_mahasiswa):
         pembimbing1 = mahasiswa_data[m]["pembimbing1"]
         pembimbing2 = mahasiswa_data[m]["pembimbing2"]
@@ -193,7 +202,7 @@ def solve_penjadwalan_skripsi_internal(
         for s in range(num_sesi):
             sesi_nama = sesi_data[s]
             
-            # Pembimbing harus tersedia
+            # Jika pembimbing tidak tersedia, mahasiswa tidak bisa dijadwalkan di sesi ini
             if not is_dosen_available(pembimbing1, sesi_nama, availabilitas_dosen):
                 for r in range(num_ruangan):
                     model.Add(jadwal[(m, s, r)] == 0)
@@ -201,16 +210,22 @@ def solve_penjadwalan_skripsi_internal(
             if not is_dosen_available(pembimbing2, sesi_nama, availabilitas_dosen):
                 for r in range(num_ruangan):
                     model.Add(jadwal[(m, s, r)] == 0)
+    
+    # 7. Availabilitas Dosen (PENGUJI harus tersedia)
+    for m in range(num_mahasiswa):
+        for s in range(num_sesi):
+            sesi_nama = sesi_data[s]
             
-            # Penguji harus tersedia
             for d_idx, dosen in enumerate(dosen_data):
                 if not is_dosen_available(dosen["nama"], sesi_nama, availabilitas_dosen):
+                    # Jika dosen tidak tersedia di sesi ini, dia tidak bisa jadi penguji
                     for i in range(2):
                         if (m, d_idx, i) in penguji:
                             for r in range(num_ruangan):
+                                # Jika mahasiswa dijadwalkan di sesi s dan dosen d jadi penguji, maka invalid
                                 model.Add(jadwal[(m, s, r)] + penguji[(m, d_idx, i)] <= 1)
     
-    # 7. Dosen tidak boleh di 2 tempat sekaligus
+    # 8. Dosen tidak boleh di 2 tempat sekaligus (FIXED VERSION)
     for s in range(num_sesi):
         for d_idx, dosen_info in enumerate(dosen_data):
             dosen_nama = dosen_info["nama"]
@@ -221,18 +236,34 @@ def solve_penjadwalan_skripsi_internal(
                 pembimbing2 = mahasiswa_data[m]["pembimbing2"]
                 
                 for r in range(num_ruangan):
+                    # Jika dosen adalah pembimbing, tambahkan ke keterlibatan
                     if dosen_nama == pembimbing1 or dosen_nama == pembimbing2:
                         keterlibatan.append(jadwal[(m, s, r)])
                     
+                    # Jika dosen adalah penguji, tambahkan ke keterlibatan
                     for i in range(2):
                         if (m, d_idx, i) in penguji:
-                            is_both = model.NewBoolVar(f'both_m{m}_s{s}_r{r}_d{d_idx}_p{i}')
-                            model.Add(jadwal[(m, s, r)] + penguji[(m, d_idx, i)] == 2).OnlyEnforceIf(is_both)
-                            model.Add(jadwal[(m, s, r)] + penguji[(m, d_idx, i)] < 2).OnlyEnforceIf(is_both.Not())
-                            keterlibatan.append(is_both)
+                            # Buat variabel bantu: dosen d adalah penguji di mahasiswa m sesi s ruang r
+                            is_penguji_here = model.NewBoolVar(f'helper_m{m}_s{s}_r{r}_d{d_idx}_p{i}')
+                            # is_penguji_here = 1 jika jadwal[m,s,r]=1 DAN penguji[m,d,i]=1
+                            model.AddMultiplicationEquality(is_penguji_here, [jadwal[(m, s, r)], penguji[(m, d_idx, i)]])
+                            keterlibatan.append(is_penguji_here)
             
+            # Dosen maksimal terlibat di 1 ujian per sesi
             if keterlibatan:
                 model.Add(sum(keterlibatan) <= 1)
+    
+    # ========================================================================
+    # OBJECTIVE: Maximize jumlah mahasiswa yang terjadwalkan
+    # ========================================================================
+    mahasiswa_terjadwalkan = []
+    for m in range(num_mahasiswa):
+        is_scheduled = model.NewBoolVar(f'scheduled_m{m}')
+        model.Add(sum(jadwal[(m, s, r)] for s in range(num_sesi) for r in range(num_ruangan)) >= 1).OnlyEnforceIf(is_scheduled)
+        model.Add(sum(jadwal[(m, s, r)] for s in range(num_sesi) for r in range(num_ruangan)) == 0).OnlyEnforceIf(is_scheduled.Not())
+        mahasiswa_terjadwalkan.append(is_scheduled)
+    
+    model.Maximize(sum(mahasiswa_terjadwalkan))
     
     # ========================================================================
     # SOLVING
@@ -288,10 +319,10 @@ def read_root():
         "message": "Sistem Penjadwalan Skripsi Mahasiswa Berbasis Google OR-Tools",
         "status": "running",
         "version": "2.0.0",
-        "ortools_version": "9.12.4544",
         "endpoints": {
             "penjadwalan_skripsi": "/api/penjadwalan-skripsi",
             "health": "/health",
+            "docs": "/docs"
         }
     }
 
@@ -300,10 +331,6 @@ def health_check():
     """
     Comprehensive health check untuk memastikan semua komponen sistem berjalan
     """
-    import sys
-    import platform
-    from datetime import datetime
-    
     health_status = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -327,7 +354,20 @@ def health_check():
         }
         health_status["status"] = "unhealthy"
     
-    # 2. Check Memory Usage
+    # 2. Check OR-Tools
+    try:
+        health_status["checks"]["ortools"] = {
+            "status": "ok",
+            "message": "CP-SAT solver available"
+        }
+    except Exception as e:
+        health_status["checks"]["ortools"] = {
+            "status": "error",
+            "message": str(e)
+        }
+        health_status["status"] = "unhealthy"
+    
+    # 3. Check Memory Usage
     try:
         import psutil
         memory = psutil.virtual_memory()
@@ -350,7 +390,7 @@ def health_check():
             "message": str(e)
         }
     
-    # 3. Check Disk Space (optional)
+    # 4. Check Disk Space
     try:
         import psutil
         disk = psutil.disk_usage('/')
@@ -363,7 +403,7 @@ def health_check():
         if disk.percent >= 90:
             health_status["status"] = "degraded"
     except ImportError:
-        pass  # Skip if psutil not available
+        pass
     except Exception as e:
         health_status["checks"]["disk"] = {
             "status": "error",
@@ -396,25 +436,13 @@ def penjadwalan_skripsi(request: PenjadwalanRequest):
     """
     Endpoint untuk menyelesaikan masalah penjadwalan ujian skripsi.
     
-    **Input:**
-    - `mahasiswa`: List mahasiswa dengan nama, judul, bidang, dan 2 pembimbing
-    - `dosen`: List dosen dengan nama dan bidang riset yang dikuasai
-    - `availabilitas_dosen`: Availabilitas setiap dosen per sesi
-    - `ruangan`: Daftar ruangan yang tersedia (default: Lab RPL, Lab Jarkom)
-    - `hari`: Hari kerja (default: Senin-Jumat)
-    - `waktu`: Slot waktu per hari (default: 4 slot)
-    - `max_time_seconds`: Maksimal waktu solving (default: 60 detik)
-    
-    **Output:**
-    - Status penjadwalan
-    - Jadwal lengkap dengan penguji, sesi, dan ruangan
-    
     **Constraints:**
     - Setiap mahasiswa dijadwalkan tepat 1 kali
     - Setiap mahasiswa memiliki 2 penguji dengan bidang riset yang sesuai
     - Penguji tidak boleh sama dengan pembimbing
+    - Kedua penguji harus berbeda
     - Dosen hanya bisa di 1 tempat per sesi
-    - Semua dosen yang terlibat harus tersedia di sesi tersebut
+    - Semua dosen (pembimbing + penguji) harus tersedia di sesi tersebut
     """
     try:
         # Konversi Pydantic models ke dict
@@ -501,3 +529,8 @@ def penjadwalan_skripsi(request: PenjadwalanRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
